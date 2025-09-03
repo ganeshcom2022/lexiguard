@@ -1,8 +1,8 @@
 """
-LexiGuard Backend API Server (updated)
-- Per-class thresholds (tunable via env vars)
-- URL normalization (adds scheme if missing)
-- Probabilities + concise reasons aligned with feature_extractor.py
+LexiGuard Backend API Server (four labels only)
+- Always returns one of: benign / phishing / malware / defacement
+- Per-class thresholds (env-tunable), with top-class fallback
+- URL normalization + reasons aligned to feature_extractor.py
 """
 
 import os
@@ -24,9 +24,9 @@ le    = joblib.load("label_encoder.pkl")
 PHISHING_THRESHOLD   = float(os.getenv("PHISHING_THRESHOLD", 0.70))
 MALWARE_THRESHOLD    = float(os.getenv("MALWARE_THRESHOLD", 0.70))
 DEFACEMENT_THRESHOLD = float(os.getenv("DEFACEMENT_THRESHOLD", 0.60))
-SUSPICIOUS_THRESHOLD = float(os.getenv("SUSPICIOUS_THRESHOLD", 0.60))
+SUSPICIOUS_THRESHOLD = float(os.getenv("SUSPICIOUS_THRESHOLD", 0.60))  # below this → benign
 
-# Helpful keyword lists
+# Helpful keyword lists (for explanations only)
 SUSPICIOUS_KEYWORDS = [
     "login","signin","verify","update","secure","account","bank","wallet",
     "reset","confirm","invoice","pay","gift","bonus","win","free","click",
@@ -61,8 +61,8 @@ def _fv(feats: dict, key: str, default=0.0) -> float:
 
 def build_reasons(url: str, feats: dict, top_label: str, top_conf: float) -> list[str]:
     """
-    Short, human-readable reasons based on *your* extractor's feature names.
-    (Matches feature_extractor.py: num_hyphens, num_digits, special_char_ratio, etc.)
+    Short, human-readable reasons based on your extractor's feature names
+    (num_hyphens, num_digits, special_char_ratio, has_ip_address, etc.).
     """
     u = (url or "").lower()
     reasons = []
@@ -97,7 +97,7 @@ def build_reasons(url: str, feats: dict, top_label: str, top_conf: float) -> lis
     if u.startswith("http://") and int(feats.get("has_https", 0)) == 0:
         reasons.append("Uses HTTP (no HTTPS)")
 
-    # Phishing / defacement hints (non-decisive, for explanation only)
+    # Hint words (for explanation only)
     for kw in SUSPICIOUS_KEYWORDS:
         if kw in u:
             reasons.append(f"Contains suspicious keyword: “{kw}”")
@@ -137,7 +137,6 @@ def predict():
     try:
         # 2) Predict probabilities
         probs = model.predict_proba(X)[0]  # [p0, p1, ...]
-        # Map index → original string class via LabelEncoder
         classes = list(le.inverse_transform(list(range(len(probs)))))
 
         top_idx   = int(probs.argmax())
@@ -145,12 +144,19 @@ def predict():
         top_conf  = float(probs[top_idx])
         low       = top_label.lower()
 
-        # 3) Class-specific thresholds
-        if   low == "phishing"   and top_conf >= PHISHING_THRESHOLD:   label_out = "phishing"
-        elif low == "malware"    and top_conf >= MALWARE_THRESHOLD:    label_out = "malware"
-        elif low == "defacement" and top_conf >= DEFACEMENT_THRESHOLD: label_out = "defacement"
-        elif top_conf < SUSPICIOUS_THRESHOLD:                           label_out = "benign"
-        else:                                                           label_out = "suspicious"
+        # 3) Force one of four labels (no "suspicious")
+        #    - If below SUSPICIOUS_THRESHOLD → benign
+        #    - Else if meets class threshold → that class
+        #    - Else fallback to the top class anyway
+        if top_conf < SUSPICIOUS_THRESHOLD:
+            label_out = "benign"
+        elif (low == "phishing"   and top_conf >= PHISHING_THRESHOLD) or \
+             (low == "malware"    and top_conf >= MALWARE_THRESHOLD)  or \
+             (low == "defacement" and top_conf >= DEFACEMENT_THRESHOLD):
+            label_out = low
+        else:
+            # Fallback to the top predicted class even if under its threshold
+            label_out = low if low in {"phishing", "malware", "defacement"} else "benign"
 
         # 4) Reasons
         reasons = build_reasons(url, feats, top_label, top_conf)
